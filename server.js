@@ -1,69 +1,7 @@
 const express = require('express');
-const axios = require('axios'); // เรียกใช้ axios สำหรับให้หลังบ้านไปดึงภาพแทน
 const app = express();
-const PORT = process.env.PORT || 3000; 
+const PORT = process.env.PORT || 3000;
 
-const CAM_USER = "admin";
-const CAM_PASS = "Maple369";
-const SNAPSHOT_PATH = "/images/snapshot.jpg";
-
-// ===================================================
-// CONFIGURATION: กำหนด IP ภายในบ้านของกล้องแต่ละตัวตรงนี้
-// ===================================================
-const cameraConfig = {
-    1: { ip: "192.168.1.17", port: 80 }, 
-    2: { ip: "192.168.1.18", port: 80 }, 
-    3: { ip: "192.168.1.19", port: 80 }, 
-    4: { ip: "192.168.1.20", port: 80 }, 
-    5: { ip: "192.168.1.21", port: 80 }
-};
-
-// เก็บสถานะกล้องปัจจุบันที่เลือก (เริ่มต้นที่กล้อง 1)
-let currentCamNumber = 1;
-
-// ===================================================
-// 1. ระบบดึงภาพหลังบ้าน (Backend Proxy) - แก้ปัญหาภาพไม่ขึ้น
-// ===================================================
-app.get('/api/camera-stream', async (req, res) => {
-    const cam = cameraConfig[currentCamNumber];
-    const targetUrl = `http://${cam.ip}:${cam.port}${SNAPSHOT_PATH}`;
-
-    try {
-        // ใช้เซิร์ฟเวอร์เป็นคนไปขอภาพจากกล้องในบ้านแทนเบราว์เซอร์
-        const response = await axios({
-            url: targetUrl,
-            method: 'GET',
-            responseType: 'stream',
-            auth: {
-                username: CAM_USER,
-                password: CAM_PASS
-            },
-            timeout: 4000 // ถ้ารอสัญญาณกล้องเกิน 4 วินาทีให้ข้าม
-        });
-        
-        // ส่งภาพกลับไปที่หน้าจอในคราบโปรโตคอลเดียวกับระบบคลาวด์
-        res.setHeader('Content-Type', 'image/jpeg');
-        response.data.pipe(res);
-    } catch (error) {
-        console.error(`❌ [BOX CAM ${currentCamNumber} Error]:`, error.message);
-        res.status(500).send('Camera error');
-    }
-});
-
-// API สำหรับเปลี่ยนหมายเลขกล้องเมื่อกดสลับ
-app.get('/api/switch-camera', (req, res) => {
-    const camId = parseInt(req.query.id);
-    if (camId >= 1 && camId <= 5) {
-        currentCamNumber = camId;
-        res.json({ success: true, currentCam: currentCamNumber });
-    } else {
-        res.json({ success: false });
-    }
-});
-
-// ===================================================
-// 2. ส่วนหน้าจอควบคุม (Frontend)
-// ===================================================
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
@@ -88,7 +26,7 @@ app.get('/', (req, res) => {
     </head>
     <body>
         <div class="container">
-            <h2>ระบบคลาวด์มัลติแคม (เปิดได้จากทุกที่ 100%)</h2>
+            <h2>ระบบคลาวด์มัลติแคม (Auto Network Switch)</h2>
             <div id="camStatus">กำลังแสดงผลวิดีโอสด: BOX CAM 1</div>
 
             <div class="btn-group">
@@ -100,47 +38,81 @@ app.get('/', (req, res) => {
             </div>
 
             <div>
-                <img id="liveCamera" src="/api/camera-stream" alt="กำลังเรียกสัญญาณภาพกล้อง...">
+                <img id="liveCamera" src="" alt="กำลังเรียกสัญญาณภาพกล้อง...">
             </div>
         </div>
 
         <script>
-            // ชี้เป้าไปที่ API ของหลังบ้านเพื่อความปลอดภัยในการดึงภาพ
-            const cameraBaseUrl = window.location.origin + "/api/camera-stream";
+            // =================================================================
+            // 🔴 ตั้งค่าลิงก์กล้อง: แยกลิงก์ในบ้าน (Local) กับ ลิงก์ดูนอกบ้าน (Cloud P2P ของแบรนด์กล้อง)
+            // =================================================================
+            const cameraConfig = {
+                1: {
+                    local: "http://admin:Maple369@192.168.1.17:80/images/snapshot.jpg",
+                    cloud: "https://คลาวด์ดูออนไลน์ของกล้องตัวที่1.com/stream" // เอาลิงก์ดูออนไลน์ของตัวกล้องมาใส่ตรงนี้
+                },
+                2: {
+                    local: "http://admin:Maple369@192.168.1.18:80/images/snapshot.jpg",
+                    cloud: "https://คลาวด์ดูออนไลน์ของกล้องตัวที่2.com/stream"
+                },
+                3: { local: "http://admin:Maple369@192.168.1.19:80/images/snapshot.jpg", cloud: "" },
+                4: { local: "http://admin:Maple369@192.168.1.20:80/images/snapshot.jpg", cloud: "" },
+                5: { local: "http://admin:Maple369@192.168.1.21:80/images/snapshot.jpg", cloud: "" }
+            };
+
+            let currentCamId = 1;
+            let streamTimer = null;
+            let useCloudFallback = false; // ตัวแปรเช็คว่าอยู่นอกบ้านหรือไม่
+            
             const imageElement = document.getElementById("liveCamera");
             const statusElement = document.getElementById("camStatus");
-            let streamTimer = null;
 
             function loadNextFrame() {
                 const nextFrame = new Image();
+                
                 nextFrame.onload = function() {
                     imageElement.src = this.src;
-                    streamTimer = setTimeout(loadNextFrame, 40); // โหลดต่อเนื่องเพื่อให้เป็นวิดีโอสด
+                    // ภาพโหลดสำเร็จ รันเฟรมถัดไปทันที (40ms)
+                    streamTimer = setTimeout(loadNextFrame, 40); 
                 };
+                
                 nextFrame.onerror = function() {
-                    streamTimer = setTimeout(loadNextFrame, 1000);
+                    // 🚨 ถ้าภาพโหลดไม่ขึ้น (เช่น อยู่นอกบ้าน แล้วดึง IP 192.168.1.x ไม่เจอ)
+                    if (!useCloudFallback && cameraConfig[currentCamId].cloud !== "") {
+                        console.log("🔴 ติดต่อ IP ในบ้านไม่ได้ -> สลับไปใช้ลิงก์คลาวด์ดูนอกบ้านอัตโนมัติ");
+                        useCloudFallback = true; // สลับโหมดเป็นนอกบ้าน
+                        loadNextFrame();
+                    } else {
+                        // ถ้าหลุดทั้งคู่ ให้รอ 2 วินาทีแล้วลองใหม่
+                        streamTimer = setTimeout(loadNextFrame, 2000);
+                    }
                 };
-                nextFrame.src = cameraBaseUrl + "?t=" + new Date().getTime();
+                
+                // เลือกลิงก์ที่จะดึงภาพตามสถานะเน็ตปัจจุบัน
+                let targetUrl = useCloudFallback ? cameraConfig[currentCamId].cloud : cameraConfig[currentCamId].local;
+                
+                // ใส่ Timestamp กันภาพค้างแคช
+                nextFrame.src = targetUrl + "?t=" + new Date().getTime();
             }
 
             function changeCamera(camId) {
                 clearTimeout(streamTimer);
-                fetch(window.location.origin + '/api/switch-camera?id=' + camId)
-                    .then(res => res.json())
-                    .then(data => {
-                        if (data.success) {
-                            statusElement.innerText = "กำลังแสดงผลวิดีโอสด: BOX CAM " + camId;
-                            const buttons = document.querySelectorAll('.cam-btn');
-                            buttons.forEach((btn, index) => {
-                                if ((index + 1) === camId) btn.classList.add('active');
-                                else btn.classList.remove('active');
-                            });
-                            loadNextFrame();
-                        }
-                    });
+                currentCamId = camId;
+                useCloudFallback = false; // รีเซ็ตให้ลองดึงในบ้านดูก่อนทุกครั้งที่สลับกล้อง
+                statusElement.innerText = "กำลังแสดงผลวิดีโอสด: BOX CAM " + camId;
+                
+                const buttons = document.querySelectorAll('.cam-btn');
+                buttons.forEach((btn, index) => {
+                    if ((index + 1) === camId) btn.classList.add('active');
+                    else btn.classList.remove('active');
+                });
+                
+                loadNextFrame();
             }
 
-            window.onload = loadNextFrame;
+            window.onload = function() {
+                changeCamera(1);
+            };
         </script>
     </body>
     </html>
@@ -148,5 +120,5 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 เซิร์ฟเวอร์คลาวด์เปิดระบบที่พอร์ต ${PORT}`);
+    console.log(`🚀 เซิร์ฟเวอร์ออนไลน์บนคลาวด์สำเร็จแล้ว`);
 });
